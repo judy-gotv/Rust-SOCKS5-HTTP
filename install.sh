@@ -270,6 +270,9 @@ ExecStart=/bin/sh -c '${BIN_PATH} -c ${INSTANCE_DIR}/%i.toml >> ${LOG_DIR}/%i.lo
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+# 允许绑定到指定网口（SO_BINDTODEVICE 需要 CAP_NET_RAW）
+AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
@@ -400,7 +403,7 @@ list_instances() {
 
 write_instance_config() {
   local name="$1" mode="$2" listen_addr="$3" port="$4"
-  local user="$5" pass="$6" max_conn="$7"
+  local user="$5" pass="$6" max_conn="$7" bind="${8:-}"
 
   mkdir -p "$INSTANCE_DIR"
   chmod 0755 "$CONFIG_DIR" "$INSTANCE_DIR"
@@ -419,6 +422,9 @@ mode = "${mode}"
 
 # 最大并发连接数，0 表示不限制
 max_connections = ${max_conn}
+
+# 出口绑定：留空 = 系统默认路由；可填网口名（如 eth0）或本地源 IP
+outbound_bind = "${bind}"
 
 connect_timeout_secs = 10
 idle_timeout_secs = 300
@@ -457,6 +463,86 @@ EOF
 
 instance_exists() {
   [ -f "${INSTANCE_DIR}/$1.toml" ]
+}
+
+# ----- 网口检测与选择 ---------------------------------------------------------
+list_interfaces() {
+  # 输出格式: 网口名|状态|主IPv4|主IPv6
+  if command_exists ip; then
+    ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | sed 's/@.*//' | while read -r ifname; do
+      [ -z "$ifname" ] && continue
+      [ "$ifname" = "lo" ] && continue
+      local state ipv4 ipv6
+      state="$(cat /sys/class/net/${ifname}/operstate 2>/dev/null || echo unknown)"
+      ipv4="$(ip -4 -o addr show dev "$ifname" 2>/dev/null | awk '{print $4}' | head -n1 | cut -d/ -f1)"
+      ipv6="$(ip -6 -o addr show dev "$ifname" 2>/dev/null | awk '$4 !~ /^fe80/ {print $4}' | head -n1 | cut -d/ -f1)"
+      printf '%s|%s|%s|%s\n' "$ifname" "$state" "${ipv4:--}" "${ipv6:--}"
+    done
+  else
+    # 退化方案
+    for d in /sys/class/net/*; do
+      [ -d "$d" ] || continue
+      local n; n="$(basename "$d")"
+      [ "$n" = "lo" ] && continue
+      printf '%s|%s|%s|%s\n' "$n" "$(cat $d/operstate 2>/dev/null || echo unknown)" "-" "-"
+    done
+  fi
+}
+
+pick_interface() {
+  # 让用户从检测到的网口中选择一个，或输入自定义网口/IP，或保持默认（不绑定）
+  local lines
+  lines="$(list_interfaces)"
+  if [ -z "$lines" ]; then
+    warn "未检测到任何网口。"
+    echo ""
+    return
+  fi
+
+  msg ""
+  msg "${C_BOLD}出口绑定（指定走哪个网口/IP 出网）${C_RESET}"
+  msg "${C_DIM}  本机检测到的网口：${C_RESET}"
+  hr
+  printf "  ${C_BOLD}%-4s %-14s %-8s %-18s %s${C_RESET}\n" "#" "网口名" "状态" "IPv4" "IPv6"
+  hr
+
+  local i=0
+  local arr=()
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    local ifname state ipv4 ipv6 color
+    ifname="$(echo "$line" | cut -d'|' -f1)"
+    state="$(echo  "$line" | cut -d'|' -f2)"
+    ipv4="$(echo   "$line" | cut -d'|' -f3)"
+    ipv6="$(echo   "$line" | cut -d'|' -f4)"
+    if [ "$state" = "up" ] || [ "$state" = "unknown" ]; then color="$C_GREEN"; else color="$C_RED"; fi
+    i=$((i+1))
+    arr+=("$ifname")
+    printf "  ${C_CYAN}%-4s${C_RESET} %-14s ${color}%-8s${C_RESET} %-18s %s\n" "$i)" "$ifname" "$state" "$ipv4" "$ipv6"
+  done <<< "$lines"
+  hr
+  printf "  ${C_CYAN}%-4s${C_RESET} %s\n" "0)" "默认（不绑定，使用系统路由）${C_GREEN} ← 推荐${C_RESET}"
+  printf "  ${C_CYAN}%-4s${C_RESET} %s\n" "c)" "手动输入网口名或源 IP"
+  msg ""
+  read -rp "请选择 [0-${i} / c，默认 0]: " sel
+  sel="${sel:-0}"
+
+  case "$sel" in
+    0|"") echo ""; return ;;
+    c|C)
+      read -rp "请输入网口名（如 eth0 / ens18 / wlan0）或源 IP（如 1.2.3.4）: " custom
+      echo "${custom// /}"
+      return
+      ;;
+    *)
+      if [[ "$sel" =~ ^[0-9]+$ ]] && [ "$sel" -ge 1 ] && [ "$sel" -le "$i" ]; then
+        echo "${arr[$((sel-1))]}"
+        return
+      fi
+      warn "无效选择，使用默认（不绑定）"
+      echo ""
+      ;;
+  esac
 }
 
 # ----- 子命令：添加实例 -------------------------------------------------------
@@ -538,6 +624,12 @@ cmd_add() {
     exit 1
   fi
 
+  # 出口绑定
+  local bind="${OUTBOUND_BIND:-}"
+  if [ -z "$bind" ] && [ -t 0 ]; then
+    bind="$(pick_interface)"
+  fi
+
   install_binary
   write_template_service
   # 如果传了 LOG_LIMIT_MB，先保存
@@ -551,7 +643,7 @@ cmd_add() {
     set_log_limit_mb "$DEFAULT_LOG_LIMIT_MB"
   fi
   apply_log_limit
-  write_instance_config "$name" "$proxy_type" "$listen_addr" "$port" "$user" "$pass" "$max_conn"
+  write_instance_config "$name" "$proxy_type" "$listen_addr" "$port" "$user" "$pass" "$max_conn" "$bind"
 
   local svc="${SERVICE_PREFIX}@${name}.service"
   systemctl daemon-reload
@@ -577,6 +669,7 @@ cmd_add() {
   printf "  %-14s %s\n" "账号"     "$user"
   printf "  %-14s %s\n" "密码"     "$pass"
   printf "  %-14s %s\n" "最大并发" "$( [ "$max_conn" = "0" ] && echo "不限制" || echo "$max_conn" )"
+  printf "  %-14s %s\n" "出口绑定" "$( [ -z "$bind" ] && echo "默认路由" || echo "$bind" )"
   printf "  %-14s %s\n" "服务"     "$svc"
   hr
   msg "${C_BOLD}客户端 URI${C_RESET}"
@@ -594,21 +687,23 @@ cmd_list() {
   fi
 
   hr
-  printf "${C_BOLD}%-20s %-8s %-22s %-10s %s${C_RESET}\n" "名称" "协议" "监听" "状态" "服务"
+  printf "${C_BOLD}%-18s %-7s %-22s %-10s %-12s %s${C_RESET}\n" "名称" "协议" "监听" "状态" "出口" "服务"
   hr
 
   while IFS= read -r name; do
     local cfg="${INSTANCE_DIR}/${name}.toml"
-    local mode listen status svc color
+    local mode listen status svc color bind
     mode="$(grep -E '^mode' "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
     listen="$(grep -E '^listen' "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    bind="$(grep -E '^outbound_bind' "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    [ -z "$bind" ] && bind="默认"
     svc="${SERVICE_PREFIX}@${name}.service"
     if systemctl is-active --quiet "$svc"; then
       status="running"; color="$C_GREEN"
     else
       status="stopped"; color="$C_RED"
     fi
-    printf "%-20s %-8s %-22s ${color}%-10s${C_RESET} %s\n" "$name" "$mode" "$listen" "$status" "$svc"
+    printf "%-18s %-7s %-22s ${color}%-10s${C_RESET} %-12s %s\n" "$name" "$mode" "$listen" "$status" "$bind" "$svc"
   done <<< "$names"
   hr
 }
@@ -848,6 +943,7 @@ ${C_BOLD}非交互式环境变量${C_RESET}
   PROXY_USER       账号
   PROXY_PASS       密码（默认随机）
   MAX_CONNECTIONS  最大并发，默认 0 表示不限制
+  OUTBOUND_BIND    出口绑定：网口名（如 eth0）或源 IP；默认空 = 不绑定
   LOG_LIMIT_MB     日志大小上限（MB），默认 ${DEFAULT_LOG_LIMIT_MB}
   BIN_PATH         二进制安装路径，默认 /usr/local/bin/rust-light-proxy
   CONFIG_DIR       配置目录，默认 /etc/rust-light-proxy

@@ -30,6 +30,7 @@
 - 🔐 **完整认证** — SOCKS5 用户名/密码、HTTP Basic
 - 🌐 **SOCKS5H 远程 DNS** — DOMAIN 地址在服务端解析
 - 🧩 **三协议合一** — `socks5` / `http` / `mixed`（单端口自动识别）
+- 🛰️ **指定出口网口/IP** — 多网卡机器可绑定某个接口出网（自动检测网口）
 - 🧵 **多实例** — systemd 模板服务，一台机器跑 N 个独立账号/端口
 - 📊 **结构化日志** — 含 `uploaded` / `downloaded` / `duration_ms` 字段
 - 🪵 **日志大小硬限制** — 默认 500 MB 上限，可菜单自定义，超过自动清空
@@ -152,6 +153,7 @@ rust-light-proxy serve --help
 | `serve --user <USER>` | 代理账号 | — |
 | `serve --pass <PASS>` | 代理密码 | — |
 | `serve --max-connections <N>` | 最大并发，`0` 表示不限制 | `0` |
+| `serve --bind <DEV\|IP>` | 出口绑定：网口名（仅 Linux）或本地源 IP；留空 = 系统默认路由 | 空 |
 
 > 💡 `--user` 与 `--pass` 都提供时启用认证，否则免认证。
 
@@ -231,6 +233,65 @@ curl -x http://myuser:mypassword@<server_ip>:8080 https://example.com
 ```text
 proto=socks5 target=example.com:443 uploaded=12345 downloaded=67890 duration_ms=1023 status=ok
 ```
+
+---
+
+## 🛰️ 出口绑定（多网卡 / 多 IP）
+
+很多 VPS 或物理机有多张网卡或多个公网 IP，需要让代理流量从指定网口/IP 出去。
+
+### 在交互菜单中选择
+
+执行「添加实例」时，脚本会自动列出本机所有网口供你选择：
+
+```text
+出口绑定（指定走哪个网口/IP 出网）
+  本机检测到的网口：
+  ──────────────────────────────────────────────
+   #   网口名         状态      IPv4               IPv6
+  ──────────────────────────────────────────────
+   1)  eth0           up        1.2.3.4            -
+   2)  eth1           up        5.6.7.8            -
+   3)  wg0            unknown   10.0.0.2           -
+  ──────────────────────────────────────────────
+   0)  默认（不绑定，使用系统路由） ← 推荐
+   c)  手动输入网口名或源 IP
+```
+
+不同主机网口名不同（`eth0` / `ens18` / `enp3s0` / `wg0` …），脚本会**自动检测**，不需要你记住。
+
+### 配置文件中手动指定
+
+```toml
+[server]
+# 留空 = 系统默认路由
+# 填网口名（仅 Linux，需要 CAP_NET_RAW）
+outbound_bind = "eth1"
+# 或填本地源 IP
+# outbound_bind = "5.6.7.8"
+```
+
+### 命令行参数
+
+```bash
+rust-light-proxy serve --listen 0.0.0.0:1080 --user u --pass p --bind eth1
+rust-light-proxy serve --listen 0.0.0.0:1080 --user u --pass p --bind 5.6.7.8
+```
+
+### 非交互式添加实例时指定
+
+```bash
+sudo ACTION=add PROXY_TYPE=socks5 INSTANCE_NAME=via-eth1 \
+     LISTEN_PORT=1080 PROXY_USER=u PROXY_PASS=p \
+     OUTBOUND_BIND=eth1 bash install.sh
+```
+
+### 注意事项
+
+- **绑定网口名**：使用 Linux `SO_BINDTODEVICE`，需要 `root` 或 `CAP_NET_RAW` 能力（`install.sh` 创建的 systemd 服务已自动授予）。
+- **绑定源 IP**：使用普通 `bind()`，不需要特殊权限，但 IP 必须真实存在于某个本机网卡上。
+- **协议族匹配**：绑定 IPv4 源 IP 时只能连 IPv4 目标；IPv6 同理。
+- 留空时走系统默认路由（最常见，推荐）。
 
 ---
 
