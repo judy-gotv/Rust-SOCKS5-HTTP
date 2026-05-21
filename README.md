@@ -32,6 +32,7 @@
 - 🧩 **三协议合一** — `socks5` / `http` / `mixed`（单端口自动识别）
 - 🧵 **多实例** — systemd 模板服务，一台机器跑 N 个独立账号/端口
 - 📊 **结构化日志** — 含 `uploaded` / `downloaded` / `duration_ms` 字段
+- 🪵 **日志大小硬限制** — 默认 500 MB 上限，可菜单自定义，超过自动清空
 - 🛡️ **资源可控** — 握手 / 连接 / 空闲三段超时，最大并发限制
 
 ---
@@ -56,10 +57,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/judy-gotv/Rust-SOCKS5-HTTP/m
 | 1 | 添加实例 | 选择协议、端口、账号密码、并发上限 |
 | 2 | 查看实例列表 | 表格显示协议、监听、运行状态 |
 | 3-5 | 启动 / 停止 / 重启 | 单个或全部 |
-| 6 | 查看流量 | 从 journalctl 累计 `uploaded` / `downloaded` |
+| 6 | 查看流量 | 累计 `uploaded` / `downloaded`，含日志当前大小 |
 | 7 | 删除实例 | 同时清理 systemd 服务和配置 |
-| 8 | 更新二进制 | 从 GitHub Releases 拉取最新版并重启实例 |
-| 9 | 卸载全部 | 服务、配置、二进制一键清理 |
+| 8 | 设置日志大小上限 | 默认 **500 MB**，可自定义；超过自动清空 |
+| 9 | 更新二进制 | 从 GitHub Releases 拉取最新版并重启实例 |
+| 10 | 卸载全部 | 服务、配置、日志、二进制一键清理 |
 
 非交互式快速添加一个 SOCKS5 实例：
 
@@ -228,6 +230,33 @@ curl -x http://myuser:mypassword@<server_ip>:8080 https://example.com
 
 ```text
 proto=socks5 target=example.com:443 uploaded=12345 downloaded=67890 duration_ms=1023 status=ok
+```
+
+---
+
+## 🪵 日志大小限制
+
+- **默认上限：500 MB**（强制生效，无需配置）
+- 日志路径：`/var/log/rust-light-proxy/<instance>.log`
+- 实现机制（双重保险）：
+  1. 写入 `logrotate` 配置 `size <N>M` + `copytruncate`（系统有 `logrotate` 时启用）
+  2. 写入 `/etc/cron.d/rust-light-proxy-logrotate`，**每分钟**检查一次，超过阈值即 `truncate` 清空
+- 超过上限时直接 **清空文件重新写入**（流量统计同时归零）
+
+修改上限（菜单第 8 项）：
+
+```bash
+# 交互菜单
+sudo bash install.sh    # 选 8
+
+# 非交互一行命令
+sudo ACTION=log LOG_LIMIT_MB=200 bash install.sh
+```
+
+恢复默认 500 MB：
+
+```bash
+sudo ACTION=log LOG_LIMIT_MB=500 bash install.sh
 ```
 
 ---

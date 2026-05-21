@@ -50,6 +50,11 @@ EOF
 BIN_PATH="${BIN_PATH:-/usr/local/bin/rust-light-proxy}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/rust-light-proxy}"
 INSTANCE_DIR="${CONFIG_DIR}/instances"
+LOG_DIR="${LOG_DIR:-/var/log/rust-light-proxy}"
+LOG_LIMIT_FILE="${CONFIG_DIR}/log-limit.conf"          # 保存当前日志大小上限（MB）
+DEFAULT_LOG_LIMIT_MB="${DEFAULT_LOG_LIMIT_MB:-500}"    # 默认 500MB
+LOGROTATE_FILE="/etc/logrotate.d/rust-light-proxy"
+LOG_CRON_FILE="/etc/cron.d/rust-light-proxy-logrotate"
 SERVICE_PREFIX="${SERVICE_PREFIX:-rust-light-proxy}"   # rust-light-proxy@<name>.service
 SERVICE_FILE="/etc/systemd/system/${SERVICE_PREFIX}@.service"
 
@@ -253,6 +258,7 @@ write_template_service() {
   if [ -f "$SERVICE_FILE" ]; then
     return
   fi
+  mkdir -p "$LOG_DIR"
   cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Rust Light Proxy (%i)
@@ -260,7 +266,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${BIN_PATH} -c ${INSTANCE_DIR}/%i.toml
+ExecStart=/bin/sh -c '${BIN_PATH} -c ${INSTANCE_DIR}/%i.toml >> ${LOG_DIR}/%i.log 2>&1'
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -273,6 +279,116 @@ ProtectHome=true
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
+}
+
+# ----- 日志大小限制 -----------------------------------------------------------
+get_log_limit_mb() {
+  if [ -f "$LOG_LIMIT_FILE" ]; then
+    cat "$LOG_LIMIT_FILE"
+  else
+    echo "$DEFAULT_LOG_LIMIT_MB"
+  fi
+}
+
+set_log_limit_mb() {
+  local mb="$1"
+  mkdir -p "$CONFIG_DIR"
+  echo "$mb" > "$LOG_LIMIT_FILE"
+  chmod 0644 "$LOG_LIMIT_FILE"
+}
+
+apply_log_limit() {
+  # 写 logrotate 配置（如果系统有 logrotate）+ 写一个定时任务做兜底强制截断
+  local limit_mb
+  limit_mb="$(get_log_limit_mb)"
+  if ! [[ "$limit_mb" =~ ^[0-9]+$ ]] || [ "$limit_mb" -le 0 ]; then
+    limit_mb="$DEFAULT_LOG_LIMIT_MB"
+    set_log_limit_mb "$limit_mb"
+  fi
+
+  mkdir -p "$LOG_DIR"
+  chmod 0755 "$LOG_DIR"
+
+  # 1) logrotate 配置（可选，由 logrotate 守护）
+  if command_exists logrotate; then
+    cat > "$LOGROTATE_FILE" <<EOF
+${LOG_DIR}/*.log {
+    size ${limit_mb}M
+    rotate 0
+    missingok
+    notifempty
+    copytruncate
+    nocompress
+}
+EOF
+    chmod 0644 "$LOGROTATE_FILE"
+  fi
+
+  # 2) 兜底：定时强制截断（每分钟检查一次，超过上限即 truncate）
+  cat > "$LOG_CRON_FILE" <<EOF
+# rust-light-proxy 日志强制大小限制（${limit_mb} MB），每分钟检查
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
+* * * * * root limit_bytes=\$((${limit_mb} * 1024 * 1024)); for f in ${LOG_DIR}/*.log; do [ -f "\$f" ] || continue; sz=\$(stat -c %s "\$f" 2>/dev/null || echo 0); if [ "\$sz" -gt "\$limit_bytes" ]; then : > "\$f"; fi; done
+EOF
+  chmod 0644 "$LOG_CRON_FILE"
+
+  # 兼容 Alpine 等无 cron.d 的系统：尝试重启 cron
+  systemctl reload cron       >/dev/null 2>&1 \
+    || systemctl reload crond >/dev/null 2>&1 \
+    || systemctl restart cron >/dev/null 2>&1 \
+    || systemctl restart crond>/dev/null 2>&1 \
+    || true
+}
+
+enforce_log_now() {
+  # 立即按当前阈值强制截断一次
+  local limit_mb limit_bytes
+  limit_mb="$(get_log_limit_mb)"
+  limit_bytes=$(( limit_mb * 1024 * 1024 ))
+  [ -d "$LOG_DIR" ] || return 0
+  shopt -s nullglob
+  for f in "$LOG_DIR"/*.log; do
+    [ -f "$f" ] || continue
+    local sz
+    sz=$(stat -c %s "$f" 2>/dev/null || echo 0)
+    if [ "$sz" -gt "$limit_bytes" ]; then
+      : > "$f"
+    fi
+  done
+  shopt -u nullglob
+}
+
+cmd_log_limit() {
+  local current
+  current="$(get_log_limit_mb)"
+  msg ""
+  msg "${C_BOLD}日志大小限制设置${C_RESET}"
+  msg "  当前上限：${C_CYAN}${current} MB${C_RESET}"
+  msg "  默认上限：${C_DIM}${DEFAULT_LOG_LIMIT_MB} MB${C_RESET}"
+  msg "  说明：${C_DIM}单个实例日志文件超过该值时会被自动清空（truncate），重新计数${C_RESET}"
+  msg ""
+  read -rp "请输入新的上限（MB），直接回车保持当前值，输入 0/d 恢复默认 ${DEFAULT_LOG_LIMIT_MB}MB: " input
+
+  local new_mb
+  if [ -z "$input" ]; then
+    new_mb="$current"
+  elif [ "$input" = "0" ] || [ "$input" = "d" ] || [ "$input" = "D" ]; then
+    new_mb="$DEFAULT_LOG_LIMIT_MB"
+  else
+    if ! [[ "$input" =~ ^[0-9]+$ ]]; then
+      err "请输入正整数（MB）"
+      return
+    fi
+    new_mb="$input"
+  fi
+
+  set_log_limit_mb "$new_mb"
+  apply_log_limit
+  enforce_log_now
+  info "日志大小上限已设置为：${new_mb} MB"
+  hint "日志目录：${LOG_DIR}/<instance>.log"
+  hint "强制截断由 cron 每分钟检查一次；若有 logrotate，则同时按 size ${new_mb}M 轮转。"
 }
 
 # ----- 实例配置 ---------------------------------------------------------------
@@ -424,6 +540,17 @@ cmd_add() {
 
   install_binary
   write_template_service
+  # 如果传了 LOG_LIMIT_MB，先保存
+  if [ -n "${LOG_LIMIT_MB:-}" ]; then
+    if [[ "$LOG_LIMIT_MB" =~ ^[0-9]+$ ]] && [ "$LOG_LIMIT_MB" -gt 0 ]; then
+      set_log_limit_mb "$LOG_LIMIT_MB"
+    fi
+  fi
+  # 首次使用默认 500MB
+  if [ ! -f "$LOG_LIMIT_FILE" ]; then
+    set_log_limit_mb "$DEFAULT_LOG_LIMIT_MB"
+  fi
+  apply_log_limit
   write_instance_config "$name" "$proxy_type" "$listen_addr" "$port" "$user" "$pass" "$max_conn"
 
   local svc="${SERVICE_PREFIX}@${name}.service"
@@ -496,14 +623,21 @@ cmd_traffic() {
   fi
 
   hr
-  printf "${C_BOLD}%-20s %-14s %-14s %-10s${C_RESET}\n" "名称" "上传(累计)" "下载(累计)" "连接数"
+  printf "${C_BOLD}%-18s %-12s %-12s %-8s %-10s${C_RESET}\n" "名称" "上传" "下载" "连接数" "日志大小"
   hr
 
   while IFS= read -r name; do
     local svc="${SERVICE_PREFIX}@${name}.service"
-    # 累加日志中的 uploaded= / downloaded=
+    local logfile="${LOG_DIR}/${name}.log"
+    # 优先读 log 文件，没有再走 journalctl
+    local source_cmd
+    if [ -f "$logfile" ]; then
+      source_cmd="cat \"$logfile\""
+    else
+      source_cmd="journalctl -u \"$svc\" --no-pager -o cat 2>/dev/null"
+    fi
     local stats
-    stats="$(journalctl -u "$svc" --no-pager -o cat 2>/dev/null \
+    stats="$(eval "$source_cmd" \
       | awk '
         {
           for (i = 1; i <= NF; i++) {
@@ -518,14 +652,19 @@ cmd_traffic() {
         }
         END { printf "%d %d %d", up + 0, dn + 0, conn + 0 }')"
 
-    local up dn conn
+    local up dn conn size_h
     up="$(echo "$stats"  | awk '{print $1}')"
     dn="$(echo "$stats"  | awk '{print $2}')"
     conn="$(echo "$stats"| awk '{print $3}')"
-    printf "%-20s %-14s %-14s %-10s\n" "$name" "$(human_bytes "$up")" "$(human_bytes "$dn")" "$conn"
+    if [ -f "$logfile" ]; then
+      size_h="$(human_bytes "$(stat -c %s "$logfile" 2>/dev/null || echo 0)")"
+    else
+      size_h="-"
+    fi
+    printf "%-18s %-12s %-12s %-8s %-10s\n" "$name" "$(human_bytes "$up")" "$(human_bytes "$dn")" "$conn" "$size_h"
   done <<< "$names"
   hr
-  hint "数据来源：journalctl 中的 access log 累计，重启服务或日志轮转后会重新计数。"
+  hint "日志大小上限：$(get_log_limit_mb) MB（超过自动清空，统计将重置）"
 }
 
 human_bytes() {
@@ -639,6 +778,9 @@ cmd_uninstall() {
   systemctl daemon-reload
 
   rm -rf "$CONFIG_DIR"
+  rm -rf "$LOG_DIR"
+  rm -f "$LOGROTATE_FILE"
+  rm -f "$LOG_CRON_FILE"
   rm -f "$BIN_PATH"
 
   info "已卸载并清理完毕。"
@@ -663,8 +805,9 @@ menu() {
     msg "  ${C_CYAN}5)${C_RESET} 重启实例"
     msg "  ${C_CYAN}6)${C_RESET} 查看流量"
     msg "  ${C_CYAN}7)${C_RESET} 删除实例"
-    msg "  ${C_CYAN}8)${C_RESET} 更新二进制（从 GitHub Releases）"
-    msg "  ${C_CYAN}9)${C_RESET} 卸载并清理全部"
+    msg "  ${C_CYAN}8)${C_RESET} 设置日志大小上限 ${C_DIM}(当前: $(get_log_limit_mb) MB)${C_RESET}"
+    msg "  ${C_CYAN}9)${C_RESET} 更新二进制（从 GitHub Releases）"
+    msg "  ${C_CYAN}10)${C_RESET} 卸载并清理全部"
     msg "  ${C_CYAN}0)${C_RESET} 退出"
     hr
     read -rp "请选择操作: " choice
@@ -676,8 +819,9 @@ menu() {
       5) cmd_action restart ;;
       6) cmd_traffic ;;
       7) cmd_remove ;;
-      8) cmd_update ;;
-      9) cmd_uninstall ;;
+      8) cmd_log_limit ;;
+      9) cmd_update ;;
+      10) cmd_uninstall ;;
       0) msg "再见。"; exit 0 ;;
       *) warn "无效输入。" ;;
     esac
@@ -696,7 +840,7 @@ ${C_BOLD}交互模式${C_RESET}
   sudo bash $(basename "$0")
 
 ${C_BOLD}非交互式环境变量${C_RESET}
-  ACTION=menu | add | list | traffic | start | stop | restart | remove | update | uninstall
+  ACTION=menu | add | list | traffic | start | stop | restart | remove | log | update | uninstall
   PROXY_TYPE       socks5 | http
   INSTANCE_NAME    实例名称，例如 socks5-1
   LISTEN_ADDR      监听地址，默认 0.0.0.0
@@ -704,8 +848,10 @@ ${C_BOLD}非交互式环境变量${C_RESET}
   PROXY_USER       账号
   PROXY_PASS       密码（默认随机）
   MAX_CONNECTIONS  最大并发，默认 0 表示不限制
+  LOG_LIMIT_MB     日志大小上限（MB），默认 ${DEFAULT_LOG_LIMIT_MB}
   BIN_PATH         二进制安装路径，默认 /usr/local/bin/rust-light-proxy
   CONFIG_DIR       配置目录，默认 /etc/rust-light-proxy
+  LOG_DIR          日志目录，默认 /var/log/rust-light-proxy
   SERVICE_PREFIX   systemd 服务前缀，默认 rust-light-proxy
   GITHUB_REPO      下载仓库，默认 ${GITHUB_REPO}
   RELEASE_TAG      Release tag，默认 latest
@@ -724,6 +870,9 @@ ${C_BOLD}示例${C_RESET}
 
   # 查看流量
   sudo ACTION=traffic bash $(basename "$0")
+
+  # 设置日志大小上限为 200MB
+  sudo ACTION=log LOG_LIMIT_MB=200 bash $(basename "$0")
 
   # 卸载
   sudo ACTION=uninstall bash $(basename "$0")
@@ -746,6 +895,18 @@ main() {
     stop)        cmd_action stop ;;
     restart)     cmd_action restart ;;
     remove|del)  cmd_remove ;;
+    log|loglimit|log-limit)
+                 if [ -n "${LOG_LIMIT_MB:-}" ]; then
+                   if ! [[ "$LOG_LIMIT_MB" =~ ^[0-9]+$ ]]; then
+                     err "LOG_LIMIT_MB 非法：$LOG_LIMIT_MB"; exit 1
+                   fi
+                   set_log_limit_mb "$LOG_LIMIT_MB"
+                   apply_log_limit
+                   enforce_log_now
+                   info "日志大小上限已设置为：${LOG_LIMIT_MB} MB"
+                 else
+                   banner; cmd_log_limit
+                 fi ;;
     update)      banner; install_binary; cmd_update ;;
     uninstall)   cmd_uninstall ;;
     help|-h|--help) usage ;;
