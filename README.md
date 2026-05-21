@@ -1,4 +1,4 @@
-# Rust Light Proxy 产物说明
+# Rust Light Proxy说明
 
 本目录包含已交叉编译完成的 Linux 二进制文件以及一键安装管理脚本。
 
