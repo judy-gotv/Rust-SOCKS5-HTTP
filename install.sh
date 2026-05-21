@@ -658,11 +658,10 @@ cmd_add() {
 
   local ip
   ip="$(detect_public_ip)"
-  local scheme="socks5h"
-  [ "$proxy_type" = "http" ] && scheme="http"
 
   hr
-  msg "${C_BOLD}${C_GREEN}实例信息${C_RESET}"
+  msg "${C_BOLD}${C_GREEN}✔ 实例已就绪${C_RESET}"
+  hr
   printf "  %-14s %s\n" "名称"     "$name"
   printf "  %-14s %s\n" "协议"     "$proxy_type"
   printf "  %-14s %s\n" "监听"     "${listen_addr}:${port}"
@@ -671,10 +670,123 @@ cmd_add() {
   printf "  %-14s %s\n" "最大并发" "$( [ "$max_conn" = "0" ] && echo "不限制" || echo "$max_conn" )"
   printf "  %-14s %s\n" "出口绑定" "$( [ -z "$bind" ] && echo "默认路由" || echo "$bind" )"
   printf "  %-14s %s\n" "服务"     "$svc"
+
+  print_client_info "$proxy_type" "$ip" "$port" "$user" "$pass"
+}
+
+# ----- 打印客户端连接信息 -----------------------------------------------------
+print_client_info() {
+  local proxy_type="$1" ip="$2" port="$3" user="$4" pass="$5"
+  local auth_part=""
+  if [ -n "$user" ] && [ -n "$pass" ]; then
+    auth_part="${user}:${pass}@"
+  fi
+
   hr
-  msg "${C_BOLD}客户端 URI${C_RESET}"
-  msg "  ${C_CYAN}${scheme}://${user}:${pass}@${ip}:${port}${C_RESET}"
+  msg "${C_BOLD}${C_CYAN}📡 客户端连接信息${C_RESET}"
   hr
+
+  if [ "$proxy_type" = "socks5" ]; then
+    msg "${C_BOLD}SOCKS5 直连模式${C_DIM}（客户端本地解析 DNS）${C_RESET}"
+    msg "  ${C_GREEN}socks5://${auth_part}${ip}:${port}${C_RESET}"
+    msg ""
+    msg "${C_BOLD}SOCKS5H 远程 DNS 模式${C_DIM}（推荐，DNS 在代理端解析）${C_RESET}"
+    msg "  ${C_GREEN}socks5h://${auth_part}${ip}:${port}${C_RESET}"
+    msg ""
+    msg "${C_BOLD}分字段格式${C_RESET}"
+    printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Host:"   "$ip"
+    printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Port:"   "$port"
+    printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Type:"   "SOCKS5"
+    if [ -n "$user" ]; then
+      printf "  ${C_DIM}%-10s${C_RESET} %s\n" "User:"   "$user"
+      printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Pass:"   "$pass"
+    else
+      printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Auth:"   "无"
+    fi
+    msg ""
+    msg "${C_BOLD}快速测试${C_RESET}"
+    msg "  ${C_DIM}# curl 远程 DNS${C_RESET}"
+    msg "  curl -x socks5h://${auth_part}${ip}:${port} https://www.google.com"
+    msg "  ${C_DIM}# curl 直连${C_RESET}"
+    msg "  curl -x socks5://${auth_part}${ip}:${port} https://www.google.com"
+    msg "  ${C_DIM}# 查看出口 IP${C_RESET}"
+    msg "  curl -x socks5h://${auth_part}${ip}:${port} https://api.ipify.org"
+    msg ""
+    msg "${C_BOLD}环境变量${C_RESET}"
+    msg "  ${C_DIM}export${C_RESET} ALL_PROXY=socks5h://${auth_part}${ip}:${port}"
+    msg "  ${C_DIM}export${C_RESET} HTTP_PROXY=socks5h://${auth_part}${ip}:${port}"
+    msg "  ${C_DIM}export${C_RESET} HTTPS_PROXY=socks5h://${auth_part}${ip}:${port}"
+
+  elif [ "$proxy_type" = "http" ]; then
+    msg "${C_BOLD}HTTP CONNECT 模式${C_RESET}"
+    msg "  ${C_GREEN}http://${auth_part}${ip}:${port}${C_RESET}"
+    msg ""
+    msg "${C_BOLD}分字段格式${C_RESET}"
+    printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Host:"   "$ip"
+    printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Port:"   "$port"
+    printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Type:"   "HTTP / HTTPS"
+    if [ -n "$user" ]; then
+      printf "  ${C_DIM}%-10s${C_RESET} %s\n" "User:"   "$user"
+      printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Pass:"   "$pass"
+    else
+      printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Auth:"   "无"
+    fi
+    msg ""
+    msg "${C_BOLD}快速测试${C_RESET}"
+    msg "  ${C_DIM}# curl${C_RESET}"
+    msg "  curl -x http://${auth_part}${ip}:${port} https://www.google.com"
+    msg "  ${C_DIM}# 查看出口 IP${C_RESET}"
+    msg "  curl -x http://${auth_part}${ip}:${port} https://api.ipify.org"
+    msg ""
+    msg "${C_BOLD}环境变量${C_RESET}"
+    msg "  ${C_DIM}export${C_RESET} HTTP_PROXY=http://${auth_part}${ip}:${port}"
+    msg "  ${C_DIM}export${C_RESET} HTTPS_PROXY=http://${auth_part}${ip}:${port}"
+  fi
+
+  hr
+  hint "提示：将 ${ip} 替换为你需要的域名或其他公网 IP。"
+  if [ -n "$user" ]; then
+    hint "提示：请妥善保管密码，可执行 cat ${INSTANCE_DIR}/${name}.toml 查看完整配置。"
+  fi
+  hr
+}
+
+# ----- 子命令：查看连接信息 ---------------------------------------------------
+cmd_show() {
+  local target="${INSTANCE_NAME:-}"
+  local names
+  if [ -n "$target" ]; then
+    names="$target"
+  else
+    names="$(pick_instance "选择要查看的实例")" || return
+  fi
+
+  local ip
+  ip="$(detect_public_ip)"
+
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    local cfg="${INSTANCE_DIR}/${name}.toml"
+    if [ ! -f "$cfg" ]; then
+      err "实例不存在：$name"
+      continue
+    fi
+    local mode listen port user pass bind
+    mode="$(grep -E   '^mode'           "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    listen="$(grep -E '^listen'         "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    user="$(grep -E   '^username'       "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    pass="$(grep -E   '^password'       "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    bind="$(grep -E   '^outbound_bind'  "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    port="${listen##*:}"
+
+    hr
+    msg "${C_BOLD}${C_GREEN}实例：${name}${C_RESET}"
+    printf "  %-14s %s\n" "协议"     "$mode"
+    printf "  %-14s %s\n" "监听"     "$listen"
+    printf "  %-14s %s\n" "出口绑定" "$( [ -z "$bind" ] && echo "默认路由" || echo "$bind" )"
+
+    print_client_info "$mode" "$ip" "$port" "$user" "$pass"
+  done <<< "$names"
 }
 
 # ----- 子命令：列表 -----------------------------------------------------------
@@ -895,28 +1007,30 @@ menu() {
     hr
     msg "  ${C_CYAN}1)${C_RESET} 添加实例"
     msg "  ${C_CYAN}2)${C_RESET} 查看实例列表"
-    msg "  ${C_CYAN}3)${C_RESET} 启动实例"
-    msg "  ${C_CYAN}4)${C_RESET} 停止实例"
-    msg "  ${C_CYAN}5)${C_RESET} 重启实例"
-    msg "  ${C_CYAN}6)${C_RESET} 查看流量"
-    msg "  ${C_CYAN}7)${C_RESET} 删除实例"
-    msg "  ${C_CYAN}8)${C_RESET} 设置日志大小上限 ${C_DIM}(当前: $(get_log_limit_mb) MB)${C_RESET}"
-    msg "  ${C_CYAN}9)${C_RESET} 更新二进制（从 GitHub Releases）"
-    msg "  ${C_CYAN}10)${C_RESET} 卸载并清理全部"
+    msg "  ${C_CYAN}3)${C_RESET} 查看连接信息（客户端 URI）"
+    msg "  ${C_CYAN}4)${C_RESET} 启动实例"
+    msg "  ${C_CYAN}5)${C_RESET} 停止实例"
+    msg "  ${C_CYAN}6)${C_RESET} 重启实例"
+    msg "  ${C_CYAN}7)${C_RESET} 查看流量"
+    msg "  ${C_CYAN}8)${C_RESET} 删除实例"
+    msg "  ${C_CYAN}9)${C_RESET} 设置日志大小上限 ${C_DIM}(当前: $(get_log_limit_mb) MB)${C_RESET}"
+    msg "  ${C_CYAN}10)${C_RESET} 更新二进制（从 GitHub Releases）"
+    msg "  ${C_CYAN}11)${C_RESET} 卸载并清理全部"
     msg "  ${C_CYAN}0)${C_RESET} 退出"
     hr
     read -rp "请选择操作: " choice
     case "$choice" in
       1) cmd_add ;;
       2) cmd_list ;;
-      3) cmd_action start ;;
-      4) cmd_action stop ;;
-      5) cmd_action restart ;;
-      6) cmd_traffic ;;
-      7) cmd_remove ;;
-      8) cmd_log_limit ;;
-      9) cmd_update ;;
-      10) cmd_uninstall ;;
+      3) cmd_show ;;
+      4) cmd_action start ;;
+      5) cmd_action stop ;;
+      6) cmd_action restart ;;
+      7) cmd_traffic ;;
+      8) cmd_remove ;;
+      9) cmd_log_limit ;;
+      10) cmd_update ;;
+      11) cmd_uninstall ;;
       0) msg "再见。"; exit 0 ;;
       *) warn "无效输入。" ;;
     esac
@@ -935,7 +1049,7 @@ ${C_BOLD}交互模式${C_RESET}
   sudo bash $(basename "$0")
 
 ${C_BOLD}非交互式环境变量${C_RESET}
-  ACTION=menu | add | list | traffic | start | stop | restart | remove | log | update | uninstall
+  ACTION=menu | add | list | show | traffic | start | stop | restart | remove | log | update | uninstall
   PROXY_TYPE       socks5 | http
   INSTANCE_NAME    实例名称，例如 socks5-1
   LISTEN_ADDR      监听地址，默认 0.0.0.0
@@ -986,6 +1100,7 @@ main() {
     menu)        menu ;;
     add)         banner; cmd_add ;;
     list|ls)     banner; cmd_list ;;
+    show|info)   banner; cmd_show ;;
     traffic)     banner; cmd_traffic ;;
     start)       cmd_action start ;;
     stop)        cmd_action stop ;;
