@@ -1,11 +1,43 @@
 # Rust Light Proxy 产物说明
 
-本目录包含已交叉编译完成的 Linux 二进制文件，开箱即用，无需安装 Rust 工具链。
+本目录包含已交叉编译完成的 Linux 二进制文件以及一键安装管理脚本。
+
+## 一键安装（推荐）
+
+直接在 VPS 上运行，脚本会自动识别架构并从 GitHub Releases 下载对应二进制：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/judy-gotv/Rust-SOCKS5-HTTP/main/install.sh)
+```
+
+或者：
+
+```bash
+wget -qO- https://raw.githubusercontent.com/judy-gotv/Rust-SOCKS5-HTTP/main/install.sh | sudo bash
+```
+
+进入交互菜单后可：
+
+- 添加 SOCKS5 / HTTP CONNECT 实例
+- 自定义端口、账号、密码、最大并发
+- 启动 / 停止 / 重启 / 删除任意实例
+- 查看实例流量统计（基于 access log 累计）
+- 更新二进制（自动重启所有实例）
+- 一键卸载并清理
+
+非交互式快速安装一个 SOCKS5 实例：
+
+```bash
+sudo ACTION=add PROXY_TYPE=socks5 INSTANCE_NAME=socks5-1 \
+     LISTEN_PORT=1080 PROXY_USER=myuser PROXY_PASS=mypass \
+     bash <(curl -fsSL https://raw.githubusercontent.com/judy-gotv/Rust-SOCKS5-HTTP/main/install.sh)
+```
 
 ## 文件清单
 
 | 文件 | 目标架构 | 适用平台 |
 |---|---|---|
+| `install.sh` | 通用 | 一键安装管理脚本（带菜单 + 流量统计 + 多实例） |
 | `rust-light-proxy-linux-amd64` | x86_64 | 常见 VPS、Intel/AMD 服务器、桌面 Linux |
 | `rust-light-proxy-linux-arm64` | aarch64 | ARM64 服务器、树莓派 4/5（64 位系统）、Oracle Cloud Ampere、AWS Graviton |
 | `rust-light-proxy-linux-armv7` | ARMv7 hardfloat | 树莓派 2/3、各类 32 位 ARM 路由器/盒子 |
