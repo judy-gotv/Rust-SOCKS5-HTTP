@@ -491,20 +491,23 @@ list_interfaces() {
 
 pick_interface() {
   # 让用户从检测到的网口中选择一个，或输入自定义网口/IP，或保持默认（不绑定）
+  # 注意：本函数通过 $(pick_interface) 捕获返回值，所有 UI 输出必须重定向到 /dev/tty
   local lines
   lines="$(list_interfaces)"
   if [ -z "$lines" ]; then
-    warn "未检测到任何网口。"
+    warn "未检测到任何网口。" >/dev/tty
     echo ""
     return
   fi
 
-  msg ""
-  msg "${C_BOLD}出口绑定（指定走哪个网口/IP 出网）${C_RESET}"
-  msg "${C_DIM}  本机检测到的网口：${C_RESET}"
-  hr
-  printf "  ${C_BOLD}%-4s %-14s %-8s %-18s %s${C_RESET}\n" "#" "网口名" "状态" "IPv4" "IPv6"
-  hr
+  {
+    msg ""
+    msg "${C_BOLD}出口绑定（指定走哪个网口/IP 出网）${C_RESET}"
+    msg "${C_DIM}  本机检测到的网口：${C_RESET}"
+    hr
+    printf "  ${C_BOLD}%-4s %-14s %-8s %-18s %s${C_RESET}\n" "#" "网口名" "状态" "IPv4" "IPv6"
+    hr
+  } >/dev/tty
 
   local i=0
   local arr=()
@@ -518,19 +521,25 @@ pick_interface() {
     if [ "$state" = "up" ] || [ "$state" = "unknown" ]; then color="$C_GREEN"; else color="$C_RED"; fi
     i=$((i+1))
     arr+=("$ifname")
-    printf "  ${C_CYAN}%-4s${C_RESET} %-14s ${color}%-8s${C_RESET} %-18s %s\n" "$i)" "$ifname" "$state" "$ipv4" "$ipv6"
+    printf "  ${C_CYAN}%-4s${C_RESET} %-14s ${color}%-8s${C_RESET} %-18s %s\n" "$i)" "$ifname" "$state" "$ipv4" "$ipv6" >/dev/tty
   done <<< "$lines"
-  hr
-  printf "  ${C_CYAN}%-4s${C_RESET} %s\n" "0)" "默认（不绑定，使用系统路由）${C_GREEN} ← 推荐${C_RESET}"
-  printf "  ${C_CYAN}%-4s${C_RESET} %s\n" "c)" "手动输入网口名或源 IP"
-  msg ""
-  read -rp "请选择 [0-${i} / c，默认 0]: " sel
+
+  {
+    hr
+    printf "  ${C_CYAN}%-4s${C_RESET} %s\n" "0)" "默认（不绑定，使用系统路由）${C_GREEN} ← 推荐${C_RESET}"
+    printf "  ${C_CYAN}%-4s${C_RESET} %s\n" "c)" "手动输入网口名或源 IP"
+    msg ""
+  } >/dev/tty
+
+  local sel
+  read -rp "请选择 [0-${i} / c，默认 0]: " sel </dev/tty
   sel="${sel:-0}"
 
   case "$sel" in
     0|"") echo ""; return ;;
     c|C)
-      read -rp "请输入网口名（如 eth0 / ens18 / wlan0）或源 IP（如 1.2.3.4）: " custom
+      local custom
+      read -rp "请输入网口名（如 eth0 / ens18 / wlan0）或源 IP（如 1.2.3.4）: " custom </dev/tty
       echo "${custom// /}"
       return
       ;;
@@ -539,7 +548,7 @@ pick_interface() {
         echo "${arr[$((sel-1))]}"
         return
       fi
-      warn "无效选择，使用默认（不绑定）"
+      warn "无效选择，使用默认（不绑定）" >/dev/tty
       echo ""
       ;;
   esac
@@ -891,24 +900,28 @@ human_bytes() {
 
 # ----- 子命令：启停 -----------------------------------------------------------
 pick_instance() {
+  # 同样：通过 $(pick_instance) 调用，UI 必须输出到 /dev/tty
   local prompt="${1:-请选择实例}"
   local names
   names="$(list_instances)"
   if [ -z "$names" ]; then
-    warn "暂无实例。"
+    warn "暂无实例。" >/dev/tty
     return 1
   fi
-  msg ""
-  msg "${C_BOLD}${prompt}${C_RESET}"
+  {
+    msg ""
+    msg "${C_BOLD}${prompt}${C_RESET}"
+  } >/dev/tty
   local i=0
   local arr=()
   while IFS= read -r n; do
     i=$((i+1))
     arr+=("$n")
-    printf "  ${C_CYAN}%2d)${C_RESET} %s\n" "$i" "$n"
+    printf "  ${C_CYAN}%2d)${C_RESET} %s\n" "$i" "$n" >/dev/tty
   done <<< "$names"
-  printf "  ${C_CYAN}%2d)${C_RESET} 全部\n" "$((i+1))"
-  read -rp "请选择 [1-$((i+1))]: " sel
+  printf "  ${C_CYAN}%2d)${C_RESET} 全部\n" "$((i+1))" >/dev/tty
+  local sel
+  read -rp "请选择 [1-$((i+1))]: " sel </dev/tty
   if [ "$sel" = "$((i+1))" ]; then
     printf '%s\n' "${arr[@]}"
     return 0
@@ -917,7 +930,7 @@ pick_instance() {
     echo "${arr[$((sel-1))]}"
     return 0
   fi
-  err "选择无效。"
+  err "选择无效。" >/dev/tty
   return 1
 }
 
