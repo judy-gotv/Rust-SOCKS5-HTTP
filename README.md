@@ -1,8 +1,8 @@
-<h1 align="center">🚀 Rust Light Proxy <sup><sub>v2</sub></sup></h1>
+<h1 align="center">🚀 Rust Light Proxy <sup><sub>v3</sub></sup></h1>
 
 <p align="center">
   轻量、稳定、低占用的 <b>SOCKS5 / SOCKS5H / HTTP CONNECT</b> 代理服务<br/>
-  <sub>Rust + monoio (Linux io_uring) + mimalloc，单二进制，开箱即用</sub>
+  <sub>Rust + monoio (Linux io_uring) + mimalloc · 支持 Cloudflare WARP / kernel WireGuard 出站</sub>
 </p>
 
 <p align="center">
@@ -24,21 +24,26 @@
 
 ---
 
-## ✨ 特性（v2 全新升级）
+## ✨ 特性（v3 全新升级）
 
-- 🪶 **轻量** — Release 二进制 ~2 MB（已 strip），空闲内存 < 20 MB
+- 🪶 **轻量** — Release 二进制 ~3.5 MB（已 strip），空闲内存 < 20 MB
 - ⚡ **极致性能** — Linux 下基于 **monoio + io_uring**，TCP 转发走 **splice() 零拷贝**
 - 🚀 **mimalloc 分配器** — 高并发短连接场景显著降低分配开销
 - 🔐 **完整认证** — SOCKS5 用户名/密码、HTTP Basic，**常量时间**对比（`subtle`），抗时序侧信道
-- 🌐 **SOCKS5H 远程 DNS** — DOMAIN 在服务端解析；内置 LRU 缓存 + 负向缓存 + 飞行去重
-- 🌍 **Happy Eyeballs (RFC 8305)** — IPv4 / IPv6 双栈并发竞速，连接更快
-- 🧩 **三协议合一** — `socks5` / `http` / `mixed`（单端口自动识别）
-- 🛰️ **指定出口网口/IP** — `SO_BINDTODEVICE`，多网卡机器可绑接口出网（自动检测网口）
+- 🌐 **协议四选一** — `socks5` / `socks5h` / `http` / `mixed`（单端口自动识别）
+- 🛰️ **命名出站 profile（v3 新增）**
+  - `default` — 系统默认路由
+  - `ipv4` — 只解析 / 连接 IPv4
+  - `ipv6` — 只解析 / 连接 IPv6
+  - `wireguard_kernel` — 内核 WireGuard 接口（**Cloudflare WARP**），SO_MARK + policy routing
+- 🧠 **DNS 智能** — 内置 LRU 缓存 + 负向缓存 + 飞行去重；prefer_ipv4 可控
+- 🌍 **Happy Eyeballs (RFC 8305)** — IPv4 / IPv6 双栈并发竞速
+- 🔌 **指定出口网口/IP** — `SO_BINDTODEVICE`，多网卡机器可绑接口出网（自动检测网口）
 - 🛡️ **安全卫士** — 每 IP 速率限制、认证失败封禁、慢速握手防护（slowloris）
 - 🧵 **多实例** — systemd 模板服务，一台机器跑 N 个独立账号/端口
 - 📊 **结构化日志** — 含 `uploaded` / `downloaded` / `duration_ms` 字段
 - 🪵 **日志大小硬限制** — 默认 500 MB 上限，可菜单自定义，超过自动清空
-- 🔒 **systemd 加固** — `DynamicUser` + `MemoryDenyWriteExecute` + `ProtectSystem=strict`
+- 🔒 **systemd 加固** — `MemoryDenyWriteExecute` + `ProtectSystem=strict` + 受限 CAP
 
 ---
 
@@ -59,15 +64,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/judy-gotv/Rust-SOCKS5-HTTP/m
 
 | # | 功能 | 说明 |
 |:-:|---|---|
-| 1 | 添加实例 | 选择协议（socks5 / http / **mixed**）、端口、账号密码、出口网口 |
-| 2 | 查看实例列表 | 表格显示协议、监听、运行状态 |
-| 3-5 | 启动 / 停止 / 重启 | 单个或全部 |
-| 6 | 查看流量 | 累计 `uploaded` / `downloaded`，含日志当前大小 |
-| 7 | 删除实例 | 同时清理 systemd 服务和配置 |
-| 8 | 设置日志大小上限 | 默认 **500 MB**，可自定义；超过自动清空 |
-| 9 | 更新二进制 | 从 GitHub Releases 拉取最新版并重启实例 |
-| 10 | 卸载全部 | 服务、配置、日志、二进制一键清理 |
-| 11 | 查看连接信息 | 打印每个实例的 `socks5h://` / `http://` 连接 URL |
+| 1 | 添加实例 | 协议（**socks5 / socks5h / http / mixed**）、出站 profile（**default / ipv4 / ipv6 / warp**）、端口、账号密码 |
+| 2 | 查看实例列表 | 表格显示协议、监听、状态、出站 profile |
+| 3 | 查看连接信息 | 打印每个实例的 `socks5h://` / `http://` 客户端 URL |
+| 4-6 | 启动 / 停止 / 重启 | 单个或全部 |
+| 7 | 查看流量 | 累计 `uploaded` / `downloaded`，含日志当前大小 |
+| 8 | 删除实例 | 同时清理 systemd 服务和配置 |
+| 9 | 设置日志大小上限 | 默认 **500 MB**，可自定义；超过自动清空 |
+| 10 | 更新二进制 | 从 GitHub Releases 拉取最新版并重启实例 |
+| 11 | 卸载全部 | 服务、配置、日志、二进制一键清理 |
 
 非交互式快速添加一个 SOCKS5 实例：
 
@@ -323,6 +328,47 @@ rust-light-proxy serve --listen 0.0.0.0:1080 --user u --pass-env P --bind 5.6.7.
 
 ---
 
+## 🛰️ 出站 profile（v3 新增）
+
+v3 起支持**命名出站 profile**，让不同的 listener 走完全不同的出口路径，无需多个进程：
+
+| profile | 类型 | 说明 |
+|---|---|---|
+| `default` | 系统默认路由 | 等同 v2 行为 |
+| `ipv4` | IPv4-only | DNS 仅解析 A 记录，连接仅走 IPv4 |
+| `ipv6` | IPv6-only | DNS 仅解析 AAAA 记录，连接仅走 IPv6 |
+| `wireguard_kernel` | Linux kernel WireGuard | Cloudflare WARP / 自建 WG，**SO_MARK + policy routing**，不接管默认路由 |
+
+### 协议语义说明（重要）
+
+| 协议 | 客户端目标 | 谁解析 DNS |
+|---|---|---|
+| `socks5`  | 必须传 IP        | 客户端本地 |
+| `socks5h` | 域名（推荐）     | **代理端**（受 profile 控制） |
+| `http`    | HTTP CONNECT 目标 | **代理端** |
+| `mixed`   | 同端口自动识别    | 视具体协议 |
+
+> ✨ 想用 WARP / IPv6 出口绕过封锁？选 **`socks5h` + ipv4/ipv6/warp profile**，DNS 走代理端，路径由 profile 决定。
+
+### Cloudflare WARP 一键配置
+
+```bash
+# 交互菜单：添加实例 → 协议选 2 (SOCKS5H) → 出站 profile 选 4 (warp)
+sudo bash install.sh
+
+# 非交互（提前注册好 WARP，拿到 private/peer pubkey）：
+sudo ACTION=add PROXY_TYPE=socks5h INSTANCE_NAME=warp-1 \
+     LISTEN_PORT=1089 PROXY_USER=u PROXY_PASS=p \
+     OUTBOUND_PROFILE=warp \
+     WG_PRIVATE_KEY='你的WG私钥' \
+     WG_PEER_PUBLIC_KEY='WARP对端公钥' \
+     bash install.sh
+```
+
+WARP profile 通过 **SO_MARK + 策略路由表** 选择出口，避免改动主默认路由——其他实例完全不受影响。
+
+---
+
 ## 🪵 日志大小限制
 
 - **默认上限：500 MB**（强制生效，无需配置）
@@ -354,7 +400,7 @@ sudo ACTION=log LOG_LIMIT_MB=500 bash install.sh
 
 <table>
 <tr>
-<th>✅ v2 已实现</th>
+<th>✅ v3 已实现</th>
 <th>🛣 后续路线</th>
 </tr>
 <tr>
@@ -368,6 +414,8 @@ sudo ACTION=log LOG_LIMIT_MB=500 bash install.sh
 - `mixed` 单端口双协议
 - monoio io_uring + splice 零拷贝
 - mimalloc 分配器
+- **命名出站 profile：default / ipv4 / ipv6 / wireguard_kernel**
+- **Cloudflare WARP 出口（SO_MARK + policy routing）**
 - 握手 / 连接 / 空闲三段超时
 - 最大并发限制 + 每 IP 速率限制
 - 认证失败封禁 / slowloris 防护

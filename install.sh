@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Rust Light Proxy v2  ·  一键安装管理脚本
+#  Rust Light Proxy v3  ·  一键安装管理脚本
 #  -----------------------------------------------------------------------------
 #  · 自动识别 amd64 / arm64 / armv7 架构
 #  · 自动从 GitHub Releases 下载二进制（也支持脚本同目录离线安装）
 #  · systemd 服务 + 自动重启 + 资源沙箱
 #  · 交互菜单 / 非交互 ACTION=xxx 双模式
+#  · 协议：socks5 / socks5h / http / mixed
+#  · 出站 profile：default / ipv4 / ipv6 / wireguard_kernel (Cloudflare WARP)
 #  · 网口检测、出口绑定、日志大小限制、流量统计、客户端 URI 打印
 #  · 适用：Debian / Ubuntu / CentOS / RHEL / Fedora / Alpine / Arch
 # =============================================================================
@@ -42,8 +44,8 @@ banner() {
   cat <<EOF
 ${C_CYAN}${C_BOLD}
 ╔══════════════════════════════════════════════════════════════╗
-║         Rust Light Proxy  v2  ·  一键安装管理脚本             ║
-║         SOCKS5 / SOCKS5H / HTTP CONNECT  ·  高性能轻量代理    ║
+║         Rust Light Proxy  v3  ·  一键安装管理脚本             ║
+║   SOCKS5 / SOCKS5H / HTTP / Mixed  ·  WARP / WireGuard 出站  ║
 ╚══════════════════════════════════════════════════════════════╝${C_RESET}
 EOF
 }
@@ -255,9 +257,9 @@ Restart=on-failure
 RestartSec=2s
 LimitNOFILE=1048576
 
-# 允许绑定指定网口 / 绑定 <1024 端口（SO_BINDTODEVICE 需要 CAP_NET_RAW）
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+# 允许绑定指定网口 / <1024 端口；CAP_NET_ADMIN 用于 v3 wireguard_kernel 出站
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN
 
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -294,25 +296,106 @@ instance_exists() {
 write_instance_config() {
   local name="$1" mode="$2" listen_addr="$3" port="$4"
   local user="$5" pass="$6" max_conn="$7" bind="${8:-}"
+  local outbound_profile="${9:-default}"
+  # WireGuard / WARP 参数（仅 outbound_profile=warp 时使用，从环境变量读取）
+  local wg_iface="${WG_INTERFACE:-warp0}"
+  local wg_mark="${WG_MARK:-1001}"
+  local wg_table="${WG_TABLE:-1001}"
+  local wg_priority="${WG_PRIORITY:-11001}"
+  local wg_privkey="${WG_PRIVATE_KEY:-}"
+  local wg_addr4="${WG_ADDR4:-172.16.0.2/32}"
+  local wg_addr6="${WG_ADDR6:-}"
+  local wg_mtu="${WG_MTU:-1280}"
+  local wg_peer_pub="${WG_PEER_PUBLIC_KEY:-}"
+  local wg_endpoint="${WG_ENDPOINT:-engage.cloudflareclient.com:2408}"
+  local wg_allowed_ips="${WG_ALLOWED_IPS:-0.0.0.0/0, ::/0}"
+  local wg_keepalive="${WG_KEEPALIVE:-25}"
 
   mkdir -p "$INSTANCE_DIR"
   chmod 0755 "$CONFIG_DIR" "$INSTANCE_DIR"
 
+  # v3 协议拆分：socks5 / socks5h / http / mixed
   local http_enabled="false"
   local socks_enabled="true"
+  local remote_dns="false"
+  local legacy_mode="$mode"
   case "$mode" in
-    http)  http_enabled="true";  socks_enabled="false" ;;
-    mixed) http_enabled="true";  socks_enabled="true"  ;;
+    socks5)  http_enabled="false"; socks_enabled="true"; remote_dns="false"; legacy_mode="socks5" ;;
+    socks5h) http_enabled="false"; socks_enabled="true"; remote_dns="true";  legacy_mode="socks5" ;;
+    http)    http_enabled="true";  socks_enabled="false"; legacy_mode="http" ;;
+    mixed)   http_enabled="true";  socks_enabled="true";  remote_dns="true"; legacy_mode="mixed" ;;
   esac
 
   local auth_enabled="true"
   if [ -z "$user" ] || [ -z "$pass" ]; then auth_enabled="false"; fi
 
+  # 构造 [[outbounds]] 与 [[listeners]] 块
+  local outbounds_block=""
+  local listener_outbound="default"
+  case "$outbound_profile" in
+    ipv4) listener_outbound="ipv4" ;;
+    ipv6) listener_outbound="ipv6" ;;
+    warp) listener_outbound="warp" ;;
+    *)    listener_outbound="default" ;;
+  esac
+
+  outbounds_block=$'[[outbounds]]\nname = "default"\ntype = "default"\n\n[[outbounds]]\nname = "ipv4"\ntype = "ipv4"\n\n[[outbounds]]\nname = "ipv6"\ntype = "ipv6"\n'
+
+  if [ "$outbound_profile" = "warp" ]; then
+    local addrs_line="\"${wg_addr4}\""
+    [ -n "$wg_addr6" ] && addrs_line="\"${wg_addr4}\", \"${wg_addr6}\""
+    # allowed_ips: split by comma
+    local allowed_ips_toml=""
+    local _aip
+    IFS=',' read -ra _aip_arr <<< "$wg_allowed_ips"
+    for _aip in "${_aip_arr[@]}"; do
+      _aip="${_aip# }"; _aip="${_aip% }"
+      [ -z "$_aip" ] && continue
+      [ -n "$allowed_ips_toml" ] && allowed_ips_toml+=", "
+      allowed_ips_toml+="\"${_aip}\""
+    done
+
+    outbounds_block+=$'\n[[outbounds]]\nname = "warp"\ntype = "wireguard_kernel"\n'
+    outbounds_block+="interface = \"${wg_iface}\""$'\n'
+    outbounds_block+="mark = ${wg_mark}"$'\n'
+    outbounds_block+=$'bind_interface = true\n\n'
+    outbounds_block+=$'[outbounds.wireguard]\nmanage = true\ncreate_interface = true\nsetup_routes = true\n'
+    outbounds_block+="private_key = \"${wg_privkey}\""$'\n'
+    outbounds_block+="addresses = [${addrs_line}]"$'\n'
+    outbounds_block+=$'listen_port = 0\n'
+    outbounds_block+="mtu = ${wg_mtu}"$'\n'
+    outbounds_block+="peer_public_key = \"${wg_peer_pub}\""$'\n'
+    outbounds_block+="endpoint = \"${wg_endpoint}\""$'\n'
+    outbounds_block+="allowed_ips = [${allowed_ips_toml}]"$'\n'
+    outbounds_block+="persistent_keepalive_secs = ${wg_keepalive}"$'\n'
+    outbounds_block+="route_table = ${wg_table}"$'\n'
+    outbounds_block+="route_priority = ${wg_priority}"$'\n'
+  fi
+
+  # listeners：mixed 模式同时挂 socks5h + http；其余单 listener
+  local listeners_block=""
+  if [ "$mode" = "mixed" ]; then
+    listeners_block+=$'[[listeners]]\n'
+    listeners_block+="name = \"${name}-socks5h\""$'\n'
+    listeners_block+="listen = \"${listen_addr}:${port}\""$'\n'
+    listeners_block+=$'protocol = "socks5h"\n'
+    listeners_block+="outbound = \"${listener_outbound}\""$'\n'
+    # mixed = 同端口自动识别，不要双 listener，由 server.mode = mixed 触发自动识别
+    listeners_block=""
+  else
+    listeners_block+=$'[[listeners]]\n'
+    listeners_block+="name = \"${name}-${mode}\""$'\n'
+    listeners_block+="listen = \"${listen_addr}:${port}\""$'\n'
+    listeners_block+="protocol = \"${mode}\""$'\n'
+    listeners_block+="outbound = \"${listener_outbound}\""$'\n'
+  fi
+
   cat > "${INSTANCE_DIR}/${name}.toml" <<EOF
-# rust-light-proxy v2 实例：${name}
+# rust-light-proxy v3 实例：${name}
+# protocol=${mode}  outbound=${outbound_profile}
 [server]
 listen = "${listen_addr}:${port}"
-mode = "${mode}"
+mode = "${legacy_mode}"
 
 # 最大并发连接（硬上限）；0 表示采用安全默认 512
 max_connections = ${max_conn}
@@ -323,12 +406,12 @@ handshake_timeout_secs = 2
 shutdown_grace_secs = 15
 max_pending_connects = 128
 
-# 出口绑定：留空 = 系统默认路由；可填网口名（eth0）或本地源 IP
+# 旧单监听模式的出站绑定（保留兼容；多 outbound 模式以 [[outbounds]] 为准）
 outbound_bind = "${bind}"
-
-# SOCKS5 reply 是否暴露真实绑定地址（默认隐藏 = 0.0.0.0:0）
 expose_bind_addr = false
 
+${outbounds_block}
+${listeners_block}
 [auth]
 enabled = ${auth_enabled}
 username = "${user}"
@@ -336,7 +419,7 @@ password = "${pass}"
 
 [socks5]
 enabled = ${socks_enabled}
-remote_dns = true
+remote_dns = ${remote_dns}
 
 [http]
 enabled = ${http_enabled}
@@ -581,19 +664,30 @@ print_client_info() {
   msg "${C_BOLD}${C_CYAN}📡 客户端连接信息${C_RESET}"
   hr
 
-  if [ "$proxy_type" = "socks5" ] || [ "$proxy_type" = "mixed" ]; then
-    msg "${C_BOLD}SOCKS5 模式${C_DIM}（客户端本地解析 DNS）${C_RESET}"
-    msg "  ${C_GREEN}socks5://${auth_part}${ip}:${port}${C_RESET}"
-    msg ""
-    msg "${C_BOLD}SOCKS5H 模式${C_DIM}（推荐 · DNS 在代理端解析）${C_RESET}"
-    msg "  ${C_GREEN}socks5h://${auth_part}${ip}:${port}${C_RESET}"
-    msg ""
-  fi
-  if [ "$proxy_type" = "http" ] || [ "$proxy_type" = "mixed" ]; then
-    msg "${C_BOLD}HTTP CONNECT 模式${C_RESET}"
-    msg "  ${C_GREEN}http://${auth_part}${ip}:${port}${C_RESET}"
-    msg ""
-  fi
+  case "$proxy_type" in
+    socks5)
+      msg "${C_BOLD}SOCKS5 模式${C_DIM}（客户端本地解析 DNS，不接受域名目标）${C_RESET}"
+      msg "  ${C_GREEN}socks5://${auth_part}${ip}:${port}${C_RESET}"
+      msg ""
+      ;;
+    socks5h)
+      msg "${C_BOLD}SOCKS5H 模式${C_DIM}（推荐 · DNS 在代理端解析，配合 ipv4/ipv6/WARP 出站）${C_RESET}"
+      msg "  ${C_GREEN}socks5h://${auth_part}${ip}:${port}${C_RESET}"
+      msg ""
+      ;;
+    http)
+      msg "${C_BOLD}HTTP CONNECT 模式${C_DIM}（域名由代理解析）${C_RESET}"
+      msg "  ${C_GREEN}http://${auth_part}${ip}:${port}${C_RESET}"
+      msg ""
+      ;;
+    mixed)
+      msg "${C_BOLD}Mixed 模式${C_DIM}（同端口自动识别）${C_RESET}"
+      msg "  ${C_GREEN}socks5h://${auth_part}${ip}:${port}${C_RESET}   ${C_DIM}# SOCKS5（远程 DNS）${C_RESET}"
+      msg "  ${C_GREEN}socks5://${auth_part}${ip}:${port}${C_RESET}    ${C_DIM}# SOCKS5（本地 DNS）${C_RESET}"
+      msg "  ${C_GREEN}http://${auth_part}${ip}:${port}${C_RESET}      ${C_DIM}# HTTP CONNECT${C_RESET}"
+      msg ""
+      ;;
+  esac
 
   msg "${C_BOLD}分字段格式${C_RESET}"
   printf "  ${C_DIM}%-10s${C_RESET} %s\n" "Host:" "$ip"
@@ -608,10 +702,14 @@ print_client_info() {
   msg ""
 
   msg "${C_BOLD}快速测试${C_RESET}"
-  if [ "$proxy_type" = "socks5" ] || [ "$proxy_type" = "mixed" ]; then
-    msg "  ${C_DIM}# 查看出口 IP（远程 DNS）${C_RESET}"
-    msg "  curl -x socks5h://${auth_part}${ip}:${port} https://api.ipify.org"
-  fi
+  case "$proxy_type" in
+    socks5)
+      msg "  ${C_DIM}# 查看出口 IP（本地 DNS）${C_RESET}"
+      msg "  curl -x socks5://${auth_part}${ip}:${port} https://api.ipify.org" ;;
+    socks5h|mixed)
+      msg "  ${C_DIM}# 查看出口 IP（远程 DNS）${C_RESET}"
+      msg "  curl -x socks5h://${auth_part}${ip}:${port} https://api.ipify.org" ;;
+  esac
   if [ "$proxy_type" = "http" ] || [ "$proxy_type" = "mixed" ]; then
     msg "  ${C_DIM}# 查看出口 IP（HTTP CONNECT）${C_RESET}"
     msg "  curl -x http://${auth_part}${ip}:${port} https://api.ipify.org"
@@ -630,17 +728,25 @@ cmd_add() {
   local user="${PROXY_USER:-}"
   local pass="${PROXY_PASS:-}"
   local max_conn="${MAX_CONNECTIONS:-0}"
+  local outbound_profile="${OUTBOUND_PROFILE:-}"
 
   if [ -z "$proxy_type" ]; then
     msg ""
     msg "${C_BOLD}选择代理协议${C_RESET}"
-    msg "  ${C_CYAN}1)${C_RESET} SOCKS5  ${C_DIM}(支持 socks5h 远程 DNS)${C_RESET}"
-    msg "  ${C_CYAN}2)${C_RESET} HTTP CONNECT"
-    msg "  ${C_CYAN}3)${C_RESET} Mixed   ${C_DIM}(单端口同时支持 SOCKS5 与 HTTP)${C_RESET}"
-    read -rp "请选择 [1-3，默认 1]: " sel
-    case "${sel:-1}" in 1) proxy_type=socks5;; 2) proxy_type=http;; 3) proxy_type=mixed;; *) proxy_type=socks5;; esac
+    msg "  ${C_CYAN}1)${C_RESET} SOCKS5    ${C_DIM}(客户端必须传 IP，代理不接受域名目标)${C_RESET}"
+    msg "  ${C_CYAN}2)${C_RESET} SOCKS5H   ${C_DIM}(推荐 · 域名在代理端解析，配合 ipv4/ipv6/WARP)${C_RESET}"
+    msg "  ${C_CYAN}3)${C_RESET} HTTP      ${C_DIM}(HTTP CONNECT，域名由代理解析)${C_RESET}"
+    msg "  ${C_CYAN}4)${C_RESET} Mixed     ${C_DIM}(单端口自动识别 SOCKS5 或 HTTP)${C_RESET}"
+    read -rp "请选择 [1-4，默认 2]: " sel
+    case "${sel:-2}" in
+      1) proxy_type=socks5 ;;
+      2) proxy_type=socks5h ;;
+      3) proxy_type=http ;;
+      4) proxy_type=mixed ;;
+      *) proxy_type=socks5h ;;
+    esac
   fi
-  case "$proxy_type" in socks5|http|mixed) ;; *) err "未知 PROXY_TYPE：$proxy_type"; exit 1 ;; esac
+  case "$proxy_type" in socks5|socks5h|http|mixed) ;; *) err "未知 PROXY_TYPE：$proxy_type"; exit 1 ;; esac
 
   if [ -z "$name" ]; then
     local default_name idx=1
@@ -665,8 +771,51 @@ cmd_add() {
   if [ -z "$max_conn" ]; then max_conn=0; fi
   if ! [[ "$max_conn" =~ ^[0-9]+$ ]]; then err "最大并发非法：$max_conn"; exit 1; fi
 
+  # 出站 profile 选择（v3 新增）
+  if [ -z "$outbound_profile" ] && [ -t 0 ]; then
+    msg ""
+    msg "${C_BOLD}选择出站 profile（决定连接走哪条出口路径）${C_RESET}"
+    msg "  ${C_CYAN}1)${C_RESET} default ${C_DIM}(系统默认路由)${C_RESET}"
+    msg "  ${C_CYAN}2)${C_RESET} ipv4    ${C_DIM}(只解析 / 连接 IPv4)${C_RESET}"
+    msg "  ${C_CYAN}3)${C_RESET} ipv6    ${C_DIM}(只解析 / 连接 IPv6)${C_RESET}"
+    msg "  ${C_CYAN}4)${C_RESET} warp    ${C_DIM}(Cloudflare WARP / kernel WireGuard 出口)${C_RESET}"
+    read -rp "请选择 [1-4，默认 1]: " psel
+    case "${psel:-1}" in
+      1) outbound_profile=default ;;
+      2) outbound_profile=ipv4 ;;
+      3) outbound_profile=ipv6 ;;
+      4) outbound_profile=warp ;;
+      *) outbound_profile=default ;;
+    esac
+  fi
+  [ -z "$outbound_profile" ] && outbound_profile="default"
+  case "$outbound_profile" in default|ipv4|ipv6|warp) ;; *) err "未知 OUTBOUND_PROFILE：$outbound_profile"; exit 1 ;; esac
+
+  # 仅 default profile 允许网口/源 IP 绑定（其他 profile 已指定语义）
   local bind="${OUTBOUND_BIND:-}"
-  if [ -z "$bind" ] && [ -t 0 ]; then bind="$(pick_interface)"; fi
+  if [ "$outbound_profile" = "default" ] && [ -z "$bind" ] && [ -t 0 ]; then
+    bind="$(pick_interface)"
+  fi
+
+  # warp profile：检查 WireGuard 凭据
+  if [ "$outbound_profile" = "warp" ]; then
+    if [ -z "${WG_PRIVATE_KEY:-}" ] || [ -z "${WG_PEER_PUBLIC_KEY:-}" ]; then
+      if [ -t 0 ]; then
+        msg ""
+        warn "warp 出站需要 WireGuard 凭据，请粘贴 Cloudflare WARP 注册结果："
+        [ -z "${WG_PRIVATE_KEY:-}" ]    && read -rp "  WG_PRIVATE_KEY    (你的 private key): " WG_PRIVATE_KEY
+        [ -z "${WG_PEER_PUBLIC_KEY:-}" ] && read -rp "  WG_PEER_PUBLIC_KEY (peer public key): " WG_PEER_PUBLIC_KEY
+        [ -z "${WG_ADDR4:-}" ]          && read -rp "  WG_ADDR4          [172.16.0.2/32]: " WG_ADDR4
+        [ -z "${WG_ENDPOINT:-}" ]       && read -rp "  WG_ENDPOINT       [engage.cloudflareclient.com:2408]: " WG_ENDPOINT
+        export WG_PRIVATE_KEY WG_PEER_PUBLIC_KEY WG_ADDR4 WG_ENDPOINT
+      else
+        err "warp 出站需要 WG_PRIVATE_KEY 与 WG_PEER_PUBLIC_KEY 环境变量"; exit 1
+      fi
+    fi
+    if [ -z "$WG_PRIVATE_KEY" ] || [ -z "$WG_PEER_PUBLIC_KEY" ]; then
+      err "WireGuard 凭据缺失，已取消"; exit 1
+    fi
+  fi
 
   install_binary
   write_template_service
@@ -675,7 +824,7 @@ cmd_add() {
   fi
   [ ! -f "$LOG_LIMIT_FILE" ] && set_log_limit_mb "$DEFAULT_LOG_LIMIT_MB"
   apply_log_limit
-  write_instance_config "$name" "$proxy_type" "$listen_addr" "$port" "$user" "$pass" "$max_conn" "$bind"
+  write_instance_config "$name" "$proxy_type" "$listen_addr" "$port" "$user" "$pass" "$max_conn" "$bind" "$outbound_profile"
 
   local svc="${SERVICE_PREFIX}@${name}.service"
   systemctl daemon-reload
@@ -700,6 +849,7 @@ cmd_add() {
   printf "  %-14s %s\n" "账号"     "$user"
   printf "  %-14s %s\n" "密码"     "$pass"
   printf "  %-14s %s\n" "最大并发" "$( [ "$max_conn" = "0" ] && echo "默认 512" || echo "$max_conn" )"
+  printf "  %-14s %s\n" "出站 profile" "$outbound_profile"
   printf "  %-14s %s\n" "出口绑定" "$( [ -z "$bind" ] && echo "默认路由" || echo "$bind" )"
   printf "  %-14s %s\n" "服务"     "$svc"
   printf "  %-14s %s\n" "配置"     "${INSTANCE_DIR}/${name}.toml"
@@ -709,25 +859,39 @@ cmd_add() {
 }
 
 # =============================================================================
+# 实例配置解析（兼容 v3 [[listeners]] / [[outbounds]] 与旧 [server].mode）
+# =============================================================================
+parse_instance_protocol() {
+  local cfg="$1"
+  local proto; proto="$(grep -E '^[[:space:]]*protocol[[:space:]]*=' "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+  if [ -n "$proto" ]; then echo "$proto"; return; fi
+  grep -E '^mode' "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/'
+}
+parse_instance_outbound() {
+  local cfg="$1"
+  local ob; ob="$(grep -E '^[[:space:]]*outbound[[:space:]]*=' "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+  echo "${ob:-default}"
+}
+
+# =============================================================================
 # cmd_list / cmd_show / cmd_traffic / cmd_action / cmd_remove
 # =============================================================================
 cmd_list() {
   local names; names="$(list_instances)"
   if [ -z "$names" ]; then warn "暂无实例。可使用「添加实例」创建。"; return; fi
   hr
-  printf "${C_BOLD}%-18s %-7s %-22s %-10s %-12s %s${C_RESET}\n" "名称" "协议" "监听" "状态" "出口" "服务"
+  printf "${C_BOLD}%-18s %-8s %-22s %-10s %-10s %s${C_RESET}\n" "名称" "协议" "监听" "状态" "出站" "服务"
   hr
   while IFS= read -r name; do
     local cfg="${INSTANCE_DIR}/${name}.toml"
-    local mode listen status svc color bind
-    mode="$(grep -E '^mode'          "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    local mode listen status svc color outbound
+    mode="$(parse_instance_protocol "$cfg")"
     listen="$(grep -E '^listen'      "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
-    bind="$(grep -E '^outbound_bind' "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
-    [ -z "$bind" ] && bind="默认"
+    outbound="$(parse_instance_outbound "$cfg")"
     svc="${SERVICE_PREFIX}@${name}.service"
     if systemctl is-active --quiet "$svc"; then status="running"; color="$C_GREEN"
     else status="stopped"; color="$C_RED"; fi
-    printf "%-18s %-7s %-22s ${color}%-10s${C_RESET} %-12s %s\n" "$name" "$mode" "$listen" "$status" "$bind" "$svc"
+    printf "%-18s %-8s %-22s ${color}%-10s${C_RESET} %-10s %s\n" "$name" "$mode" "$listen" "$status" "$outbound" "$svc"
   done <<< "$names"
   hr
 }
@@ -743,18 +907,20 @@ cmd_show() {
     [ -z "$name" ] && continue
     local cfg="${INSTANCE_DIR}/${name}.toml"
     [ -f "$cfg" ] || { err "实例不存在：$name"; continue; }
-    local mode listen port user pass bind
-    mode="$(grep -E   '^mode'          "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    local mode listen port user pass bind outbound
+    mode="$(parse_instance_protocol "$cfg")"
     listen="$(grep -E '^listen'        "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
     user="$(grep -E   '^username'      "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
     pass="$(grep -E   '^password'      "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
     bind="$(grep -E   '^outbound_bind' "$cfg" | head -n1 | sed -E 's/.*"(.*)".*/\1/')"
+    outbound="$(parse_instance_outbound "$cfg")"
     port="${listen##*:}"
 
     hr
     msg "${C_BOLD}${C_GREEN}实例：${name}${C_RESET}"
     printf "  %-14s %s\n" "协议"     "$mode"
     printf "  %-14s %s\n" "监听"     "$listen"
+    printf "  %-14s %s\n" "出站 profile" "$outbound"
     printf "  %-14s %s\n" "出口绑定" "$( [ -z "$bind" ] && echo "默认路由" || echo "$bind" )"
 
     print_client_info "$mode" "$ip" "$port" "$user" "$pass"
@@ -912,14 +1078,15 @@ ${C_BOLD}交互模式${C_RESET}
 
 ${C_BOLD}非交互式环境变量${C_RESET}
   ACTION=menu | add | list | show | traffic | start | stop | restart | remove | log | update | uninstall
-  PROXY_TYPE       socks5 | http | mixed
+  PROXY_TYPE       socks5 | socks5h | http | mixed
   INSTANCE_NAME    实例名称，例如 socks5-1
   LISTEN_ADDR      监听地址，默认 0.0.0.0
   LISTEN_PORT      监听端口
   PROXY_USER       账号
   PROXY_PASS       密码（默认随机）
   MAX_CONNECTIONS  最大并发，0 = 默认 512
-  OUTBOUND_BIND    出口绑定：网口名（eth0）或源 IP；空 = 默认路由
+  OUTBOUND_PROFILE default | ipv4 | ipv6 | warp
+  OUTBOUND_BIND    出口绑定：网口名（eth0）或源 IP；空 = 默认路由 (仅 default profile)
   LOG_LIMIT_MB     日志大小上限（MB），默认 ${DEFAULT_LOG_LIMIT_MB}
   BIN_PATH         二进制路径，默认 ${BIN_PATH}
   CONFIG_DIR       配置目录，默认 ${CONFIG_DIR}
@@ -927,17 +1094,38 @@ ${C_BOLD}非交互式环境变量${C_RESET}
   GITHUB_REPO      下载源，默认 ${GITHUB_REPO}
   RELEASE_TAG      Release tag，默认 latest
 
+${C_BOLD}WireGuard / Cloudflare WARP 环境变量 (OUTBOUND_PROFILE=warp)${C_RESET}
+  WG_PRIVATE_KEY        本机 WireGuard private key       (必填)
+  WG_PEER_PUBLIC_KEY    Cloudflare WARP peer public key  (必填)
+  WG_ADDR4              本机 IPv4 地址，默认 172.16.0.2/32
+  WG_ADDR6              本机 IPv6 地址（可留空）
+  WG_ENDPOINT           对端端点，默认 engage.cloudflareclient.com:2408
+  WG_ALLOWED_IPS        允许 IP，默认 "0.0.0.0/0, ::/0"
+  WG_INTERFACE          内核接口名，默认 warp0
+  WG_MARK / WG_TABLE / WG_PRIORITY  SO_MARK / 路由表 / 优先级，默认 1001 / 1001 / 11001
+  WG_MTU                MTU，默认 1280
+  WG_KEEPALIVE          persistent_keepalive_secs，默认 25
+
 ${C_BOLD}示例${C_RESET}
   # 一键远程安装（无需提前下载二进制）
   bash <(curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/install.sh)
 
-  # 添加 SOCKS5 实例
-  sudo ACTION=add PROXY_TYPE=socks5 INSTANCE_NAME=socks5-1 \\
+  # 添加 SOCKS5H 实例（推荐 · 域名由代理解析）
+  sudo ACTION=add PROXY_TYPE=socks5h INSTANCE_NAME=s5h-1 \\
        LISTEN_PORT=1080 PROXY_USER=u PROXY_PASS=p bash install.sh
 
   # 添加 mixed 实例并绑定 eth1 出网
   sudo ACTION=add PROXY_TYPE=mixed INSTANCE_NAME=mix-1 \\
        LISTEN_PORT=20950 PROXY_USER=u PROXY_PASS=p OUTBOUND_BIND=eth1 bash install.sh
+
+  # 添加只走 IPv6 出口的 socks5h
+  sudo ACTION=add PROXY_TYPE=socks5h INSTANCE_NAME=v6-1 \\
+       LISTEN_PORT=2086 PROXY_USER=u PROXY_PASS=p OUTBOUND_PROFILE=ipv6 bash install.sh
+
+  # 添加 Cloudflare WARP 出口（需要 root + CAP_NET_ADMIN）
+  sudo ACTION=add PROXY_TYPE=socks5h INSTANCE_NAME=warp-1 \\
+       LISTEN_PORT=1089 PROXY_USER=u PROXY_PASS=p OUTBOUND_PROFILE=warp \\
+       WG_PRIVATE_KEY=xxxxx WG_PEER_PUBLIC_KEY=yyyyy bash install.sh
 
   # 查看流量
   sudo ACTION=traffic bash install.sh
