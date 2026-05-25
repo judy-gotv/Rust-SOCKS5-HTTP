@@ -1,15 +1,16 @@
-<h1 align="center">🚀 Rust Light Proxy</h1>
+<h1 align="center">🚀 Rust Light Proxy <sup><sub>v2</sub></sup></h1>
 
 <p align="center">
   轻量、稳定、低占用的 <b>SOCKS5 / SOCKS5H / HTTP CONNECT</b> 代理服务<br/>
-  <sub>用 Rust + Tokio 写的，单二进制，开箱即用</sub>
+  <sub>Rust + monoio (Linux io_uring) + mimalloc，单二进制，开箱即用</sub>
 </p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/language-Rust-orange?logo=rust&logoColor=white" alt="Rust">
-  <img src="https://img.shields.io/badge/runtime-Tokio-blue" alt="Tokio">
+  <img src="https://img.shields.io/badge/runtime-monoio%20%2F%20io__uring-blue" alt="monoio">
+  <img src="https://img.shields.io/badge/allocator-mimalloc-purple" alt="mimalloc">
   <img src="https://img.shields.io/badge/arch-amd64%20%7C%20arm64%20%7C%20armv7-success" alt="Arch">
-  <img src="https://img.shields.io/badge/glibc-%E2%89%A5%202.17-lightgrey" alt="glibc">
+  <img src="https://img.shields.io/badge/glibc-%E2%89%A5%202.28-lightgrey" alt="glibc">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
 </p>
 
@@ -23,18 +24,21 @@
 
 ---
 
-## ✨ 特性
+## ✨ 特性（v2 全新升级）
 
-- 🪶 **轻量** — Release 二进制 ~1.7 MB，空闲内存 < 20 MB
-- ⚡ **高性能** — 基于 Tokio + `copy_bidirectional`，零拷贝转发
-- 🔐 **完整认证** — SOCKS5 用户名/密码、HTTP Basic
-- 🌐 **SOCKS5H 远程 DNS** — DOMAIN 地址在服务端解析
+- 🪶 **轻量** — Release 二进制 ~2 MB（已 strip），空闲内存 < 20 MB
+- ⚡ **极致性能** — Linux 下基于 **monoio + io_uring**，TCP 转发走 **splice() 零拷贝**
+- 🚀 **mimalloc 分配器** — 高并发短连接场景显著降低分配开销
+- 🔐 **完整认证** — SOCKS5 用户名/密码、HTTP Basic，**常量时间**对比（`subtle`），抗时序侧信道
+- 🌐 **SOCKS5H 远程 DNS** — DOMAIN 在服务端解析；内置 LRU 缓存 + 负向缓存 + 飞行去重
+- 🌍 **Happy Eyeballs (RFC 8305)** — IPv4 / IPv6 双栈并发竞速，连接更快
 - 🧩 **三协议合一** — `socks5` / `http` / `mixed`（单端口自动识别）
-- 🛰️ **指定出口网口/IP** — 多网卡机器可绑定某个接口出网（自动检测网口）
+- 🛰️ **指定出口网口/IP** — `SO_BINDTODEVICE`，多网卡机器可绑接口出网（自动检测网口）
+- 🛡️ **安全卫士** — 每 IP 速率限制、认证失败封禁、慢速握手防护（slowloris）
 - 🧵 **多实例** — systemd 模板服务，一台机器跑 N 个独立账号/端口
 - 📊 **结构化日志** — 含 `uploaded` / `downloaded` / `duration_ms` 字段
 - 🪵 **日志大小硬限制** — 默认 500 MB 上限，可菜单自定义，超过自动清空
-- 🛡️ **资源可控** — 握手 / 连接 / 空闲三段超时，最大并发限制
+- 🔒 **systemd 加固** — `DynamicUser` + `MemoryDenyWriteExecute` + `ProtectSystem=strict`
 
 ---
 
@@ -55,7 +59,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/judy-gotv/Rust-SOCKS5-HTTP/m
 
 | # | 功能 | 说明 |
 |:-:|---|---|
-| 1 | 添加实例 | 选择协议、端口、账号密码、并发上限 |
+| 1 | 添加实例 | 选择协议（socks5 / http / **mixed**）、端口、账号密码、出口网口 |
 | 2 | 查看实例列表 | 表格显示协议、监听、运行状态 |
 | 3-5 | 启动 / 停止 / 重启 | 单个或全部 |
 | 6 | 查看流量 | 累计 `uploaded` / `downloaded`，含日志当前大小 |
@@ -63,6 +67,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/judy-gotv/Rust-SOCKS5-HTTP/m
 | 8 | 设置日志大小上限 | 默认 **500 MB**，可自定义；超过自动清空 |
 | 9 | 更新二进制 | 从 GitHub Releases 拉取最新版并重启实例 |
 | 10 | 卸载全部 | 服务、配置、日志、二进制一键清理 |
+| 11 | 查看连接信息 | 打印每个实例的 `socks5h://` / `http://` 连接 URL |
 
 非交互式快速添加一个 SOCKS5 实例：
 
@@ -100,13 +105,16 @@ uname -m
 ## 🔧 构建信息
 
 <table>
-<tr><td><b>语言</b></td><td>Rust（stable）</td></tr>
-<tr><td><b>异步运行时</b></td><td>Tokio multi-thread</td></tr>
-<tr><td><b>交叉编译</b></td><td>Rust + zig cc</td></tr>
-<tr><td><b>glibc 基线</b></td><td>2.17（CentOS 7 / Debian 8 / Ubuntu 14.04 及以上全部兼容）</td></tr>
+<tr><td><b>语言</b></td><td>Rust（stable, 1.94+）</td></tr>
+<tr><td><b>异步运行时</b></td><td>monoio（Linux io_uring）+ Tokio</td></tr>
+<tr><td><b>内存分配器</b></td><td>mimalloc</td></tr>
+<tr><td><b>交叉编译</b></td><td>Rust + zig cc (zig 0.13)</td></tr>
+<tr><td><b>glibc 基线</b></td><td><b>2.28</b>（Debian 10 / Ubuntu 18.04 / CentOS 8 / RHEL 8+ 全部兼容）</td></tr>
 <tr><td><b>链接方式</b></td><td>动态链接 glibc（仅依赖系统 libc / pthread / dl）</td></tr>
 <tr><td><b>优化选项</b></td><td><code>opt-level = 3</code> · <code>lto = thin</code> · <code>panic = abort</code> · <code>strip = true</code></td></tr>
 </table>
+
+> ⚠️ v2 起最低 glibc 提升到 **2.28**（因引入 `statx`）。如需在更老的系统运行，可自行编译 musl 静态版本。
 
 ---
 
@@ -117,11 +125,12 @@ uname -m
 scp rust-light-proxy-linux-amd64 user@server:/usr/local/bin/rust-light-proxy
 ssh user@server "chmod +x /usr/local/bin/rust-light-proxy"
 
-# 2. 启动 SOCKS5 + 认证
+# 2. 启动 SOCKS5 + 认证（v2 起密码必须走环境变量或文件）
+export RLP_PASS='mypassword'
 rust-light-proxy serve \
   --listen 0.0.0.0:1080 \
   --user myuser \
-  --pass mypassword
+  --pass-env RLP_PASS
 ```
 
 客户端就可以用：
@@ -151,31 +160,33 @@ rust-light-proxy serve --help
 | `serve --listen <ADDR>` | 监听地址 | `0.0.0.0:1080` |
 | `serve --mode <MODE>` | 代理模式：`socks5` / `http` / `mixed` | `socks5` |
 | `serve --user <USER>` | 代理账号 | — |
-| `serve --pass <PASS>` | 代理密码 | — |
-| `serve --max-connections <N>` | 最大并发，`0` 表示不限制 | `0` |
+| `serve --pass-env <VAR>` | 从指定环境变量读取密码 | — |
+| `serve --pass-file <FILE>` | 从指定文件读取密码 | — |
+| `serve --max-connections <N>` | 最大并发，`0` = 默认 512 | `0` |
 | `serve --bind <DEV\|IP>` | 出口绑定：网口名（仅 Linux）或本地源 IP；留空 = 系统默认路由 | 空 |
 
-> 💡 `--user` 与 `--pass` 都提供时启用认证，否则免认证。
+> ⚠️ **`--pass` 已禁用**（命令行密码会泄露到 `ps`/`/proc/*/cmdline`），请使用 `--pass-env` 或 `--pass-file`。
 
 ---
 
 ## 🧰 systemd 部署
 
-最简手动部署：
+最简手动部署（v2 加固版）：
 
 ```bash
 sudo cp rust-light-proxy-linux-amd64 /usr/local/bin/rust-light-proxy
 sudo chmod +x /usr/local/bin/rust-light-proxy
 
-sudo mkdir -p /etc/rust-light-proxy
+sudo mkdir -p /etc/rust-light-proxy /var/log/rust-light-proxy
 sudo tee /etc/rust-light-proxy/config.toml >/dev/null <<'EOF'
 [server]
 listen = "0.0.0.0:1080"
 mode = "socks5"
-max_connections = 0
+max_connections = 0          # 0 = 默认 512
 connect_timeout_secs = 10
 idle_timeout_secs = 300
 handshake_timeout_secs = 10
+outbound_bind = ""            # 留空 = 默认路由；可填 "eth1" 或源 IP
 
 [auth]
 enabled = true
@@ -186,9 +197,26 @@ password = "mypassword"
 enabled = true
 remote_dns = true
 
+[http]
+enabled = false
+
+[dns]
+cache_capacity = 2048
+positive_ttl_secs = 300
+negative_ttl_secs = 30
+
+[tuning]
+buffer_pool_size = 1024
+relay_buffer_bytes = 32768
+
+[security]
+per_ip_rps = 50
+auth_fail_ban_secs = 60
+
 [logging]
-level = "info"
+level = "warn"
 access_log = true
+file = "/var/log/rust-light-proxy/access.log"
 EOF
 
 sudo tee /etc/systemd/system/rust-light-proxy.service >/dev/null <<'EOF'
@@ -198,14 +226,19 @@ After=network.target
 
 [Service]
 Type=simple
+DynamicUser=yes
 ExecStart=/usr/local/bin/rust-light-proxy -c /etc/rust-light-proxy/config.toml
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 NoNewPrivileges=true
 PrivateTmp=true
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=true
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/log/rust-light-proxy
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
@@ -226,6 +259,9 @@ curl -x socks5h://myuser:mypassword@<server_ip>:1080 https://example.com
 
 # HTTP CONNECT
 curl -x http://myuser:mypassword@<server_ip>:8080 https://example.com
+
+# 本机自连测试也可以（用公网 IP 或 127.0.0.1）
+curl -x socks5h://myuser:mypassword@127.0.0.1:1080 https://www.google.com
 ```
 
 服务端日志应输出类似：
@@ -274,16 +310,8 @@ outbound_bind = "eth1"
 ### 命令行参数
 
 ```bash
-rust-light-proxy serve --listen 0.0.0.0:1080 --user u --pass p --bind eth1
-rust-light-proxy serve --listen 0.0.0.0:1080 --user u --pass p --bind 5.6.7.8
-```
-
-### 非交互式添加实例时指定
-
-```bash
-sudo ACTION=add PROXY_TYPE=socks5 INSTANCE_NAME=via-eth1 \
-     LISTEN_PORT=1080 PROXY_USER=u PROXY_PASS=p \
-     OUTBOUND_BIND=eth1 bash install.sh
+rust-light-proxy serve --listen 0.0.0.0:1080 --user u --pass-env P --bind eth1
+rust-light-proxy serve --listen 0.0.0.0:1080 --user u --pass-env P --bind 5.6.7.8
 ```
 
 ### 注意事项
@@ -326,7 +354,7 @@ sudo ACTION=log LOG_LIMIT_MB=500 bash install.sh
 
 <table>
 <tr>
-<th>✅ 已实现（第一版）</th>
+<th>✅ v2 已实现</th>
 <th>🛣 后续路线</th>
 </tr>
 <tr>
@@ -334,13 +362,17 @@ sudo ACTION=log LOG_LIMIT_MB=500 bash install.sh
 
 - SOCKS5 TCP CONNECT
 - SOCKS5 用户名/密码认证（RFC 1929）
-- SOCKS5H 远程 DNS（DOMAIN）
-- IPv4 / IPv6 / DOMAIN
+- SOCKS5H 远程 DNS（DOMAIN）+ LRU 缓存
+- Happy Eyeballs IPv4/IPv6 双栈竞速
 - HTTP CONNECT + Basic 认证
 - `mixed` 单端口双协议
-- TCP 双向转发 + 字节统计
+- monoio io_uring + splice 零拷贝
+- mimalloc 分配器
 - 握手 / 连接 / 空闲三段超时
-- 最大并发限制
+- 最大并发限制 + 每 IP 速率限制
+- 认证失败封禁 / slowloris 防护
+- 常量时间认证对比（抗时序）
+- 出口网口/源 IP 绑定
 - TOML 配置 + CLI 参数
 - 结构化访问日志
 
@@ -348,11 +380,11 @@ sudo ACTION=log LOG_LIMIT_MB=500 bash install.sh
 <td valign="top">
 
 - UDP ASSOCIATE
-- Prometheus metrics
+- Prometheus metrics（部分已就绪）
 - ACL / 端口黑名单
-- DNS 缓存
 - 配置热重载
-- 流量上报 / Web 管理
+- Web 管理界面
+- musl 静态构建版本
 
 </td>
 </tr>
@@ -363,9 +395,9 @@ sudo ACTION=log LOG_LIMIT_MB=500 bash install.sh
 ## ❓ 常见问题
 
 <details>
-<summary><b>启动报 <code>glibc not found</code> 或版本过低</b></summary>
+<summary><b>启动报 <code>GLIBC_2.28 not found</code></b></summary>
 <br/>
-本地 glibc 低于 2.17，请升级系统，或后续切换到 musl 静态构建版本。
+本地 glibc 低于 2.28（CentOS 7 / Ubuntu 16.04 等）。请升级到 Debian 10 / Ubuntu 18.04 / CentOS 8 及以上，或等待 musl 静态版本。
 </details>
 
 <details>
@@ -389,7 +421,13 @@ ss -lntp | grep 1080
 <details>
 <summary><b>认证失败</b></summary>
 <br/>
-客户端 URI 的 <code>user:pass</code> 必须与服务端 <code>--user/--pass</code> 或配置文件中的 <code>[auth]</code> 完全一致。
+客户端 URI 的 <code>user:pass</code> 必须与服务端 <code>--user / --pass-env</code> 或配置文件中的 <code>[auth]</code> 完全一致。注意 v2 起 <code>--pass</code> 已禁用。
+</details>
+
+<details>
+<summary><b>报错 <code>RLIMIT_NOFILE ... is below required ...</code></b></summary>
+<br/>
+当前进程 fd 上限太低。systemd 服务已设 <code>LimitNOFILE=1048576</code>；手动运行时执行 <code>ulimit -n 65535</code>，或降低 <code>max_connections</code>。
 </details>
 
 <details>
