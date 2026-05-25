@@ -1,6 +1,12 @@
 <h1 align="center">🚀 MicaProxy <sup><sub>v3.0.6</sub></sup></h1>
 
 <p align="center">
+  <a href="README.md"><img src="https://img.shields.io/badge/lang-%E7%AE%80%E4%BD%93%E4%B8%AD%E6%96%87-red?style=for-the-badge" alt="中文"></a>
+  <a href="README.en.md"><img src="https://img.shields.io/badge/lang-English-blue?style=for-the-badge" alt="English"></a>
+</p>
+
+
+<p align="center">
   轻量、稳定、低占用的 <b>SOCKS5 / SOCKS5 UDP / HTTP / HTTPS</b> 代理服务<br/>
   <sub>Rust + monoio (epoll / io_uring 双驱动) + mimalloc · 支持 Cloudflare WARP / kernel WireGuard 出站</sub>
 </p>
